@@ -1,0 +1,19 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Keep output directories, exclude generated results
+/outputs/**
+!/outputs/**/
+!/outputs/**/.gitkeep
+/output/**
+!/output/**/
+!/output/**/.gitkeep
