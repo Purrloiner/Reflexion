@@ -86,14 +86,14 @@ PipelineSpec = MethodSpec
 
 
 METHODS: tuple[MethodSpec, ...] = (
-#    MethodSpec(
-#        "cot",
-#        "CoT",
-#        "run_CoT",
-#        use_reflection=False,
-#        use_gt=False,
-#        use_epm=False,
-#    ),
+    MethodSpec(
+        "cot",
+        "CoT",
+        "run_CoT",
+        use_reflection=False,
+        use_gt=False,
+        use_epm=False,
+    ),
     MethodSpec(
         "cot_gt_epm_reflexion",
         "CoT + GT + EPM + Reflexion",

@@ -1,4 +1,4 @@
-"""Run and plot the two article-only PCoT PropaNews experiment arms.
+"""Run and plot the two requested article-only PCoT PropaNews arms.
 
 This module owns orchestration only.  Prompt construction and the two LLM calls
 live in :mod:`actor_pcot`/:mod:`main_pcot`; final-label parsing lives in
@@ -8,13 +8,13 @@ this module never starts an inference.
 
 Evaluation is article-major: every allowed attempt for one article finishes
 before the next article is touched.  A PCoT attempt always regenerates both
-Stage 1 and Stage 2.  The Reflexion arm carries only the last three critique
-strings for the current article; raw previous trajectories are retained for
-debugging but are never actor memory.  A progress checkpoint is atomically
-written after each completed article.  A local-memory OOM during either PCoT
-generation stage or reflection marks that article as completed/OOM-skipped,
-checkpoints it, clears recoverable caches, and continues with the next index;
-all other errors still abort the run.
+Stage 1 and Stage 2.  The full arm carries the most recent failed Stage-1
+analysis plus prediction-free Stage-2 reasoning as EPM and at most three
+separate Reflexion notes for the current article.  A progress checkpoint is
+atomically written after each completed article.  A local-memory OOM during
+either PCoT generation stage or reflection marks that article as
+completed/OOM-skipped, checkpoints it, clears recoverable caches, and
+continues with the next index; all other errors still abort the run.
 """
 
 from __future__ import annotations
@@ -34,11 +34,15 @@ if __package__:
         PCOT_FINAL_MODE,
         PROMPT_VERSION,
         SUPPORTED_FINAL_MODES,
+        format_pcot_trajectory,
         normalise_final_mode,
     )
+    from .reflection_pcot import sanitize_reflection
     from .propanews_common import (
         ARTICLE_TEXT_FIELD,
         DATASET_ID,
+        EPM_MEMORY_VERSION,
+        extract_epm_reasoning,
         is_oom_error,
         recover_from_oom,
     )
@@ -47,11 +51,15 @@ else:
         PCOT_FINAL_MODE,
         PROMPT_VERSION,
         SUPPORTED_FINAL_MODES,
+        format_pcot_trajectory,
         normalise_final_mode,
     )
+    from reflection_pcot import sanitize_reflection
     from propanews_common import (
         ARTICLE_TEXT_FIELD,
         DATASET_ID,
+        EPM_MEMORY_VERSION,
+        extract_epm_reasoning,
         is_oom_error,
         recover_from_oom,
     )
@@ -62,15 +70,16 @@ else:
 NUM: int | None = None
 MAX_TRIALS = 3
 MAX_REFLECTIONS = 3
+MAX_TRAJECTORIES = 1
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "propanews_pcot_qwen8"
 AGGREGATE_METRICS_FILENAME = "aggregate_metrics.json"
 PLOT_FILENAME = "propanews_pcot_cumulative_success.png"
 
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 4
 EVALUATION_MODE = "article_major_failure_retry_cumulative"
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 3
 CHECKPOINT_KIND = "pcot_article_progress"
 
 _OOM_ERROR_MAX_LENGTH = 500
@@ -78,23 +87,34 @@ _OOM_ERROR_MAX_LENGTH = 500
 
 @dataclass(frozen=True)
 class PipelineSpec:
-    """The two experimental switches that distinguish a PCoT arm."""
+    """The three experimental switches that distinguish a PCoT arm."""
 
     key: str
     label: str
     runner_name: str
     use_reflection: bool
+    use_gt: bool
+    use_epm: bool
 
 
 # These are the complete requested conditions.  Dataset-specific reference
 # information is not an experimental factor.
 PIPELINES: tuple[PipelineSpec, ...] = (
-    PipelineSpec("pcot", "PCoT", "run_PCoT", False),
     PipelineSpec(
-        "pcot_reflexion",
-        "PCoT + Reflexion",
-        "run_PCoT_Re",
-        True,
+        key="pcot",
+        label="PCoT",
+        runner_name="run_PCoT",
+        use_reflection=False,
+        use_gt=False,
+        use_epm=False,
+    ),
+    PipelineSpec(
+        key="pcot_gt_epm_reflexion",
+        label="PCoT + GT + EPM + Reflexion",
+        runner_name="run_PCoT_GT_EPM_Re",
+        use_reflection=True,
+        use_gt=True,
+        use_epm=True,
     ),
 )
 
@@ -112,13 +132,13 @@ class ExperimentDependencies:
     """Injected experiment boundaries for deterministic orchestration tests."""
 
     run_PCoT: Callable[..., Mapping[str, object]]
-    run_PCoT_Re: Callable[..., Mapping[str, object]]
     get_article: Callable[[Any], str]
     get_available_indices: Callable[[], Sequence[Any]]
     extract_prediction: Callable[[str], str]
     get_gold_label: Callable[[Any], Any]
     EM_score: Callable[[str, Any], bool]
     make_reflection_PCoT: Callable[[str, str, str], str]
+    run_PCoT_GT_EPM_Re: Callable[..., Mapping[str, object]]
     generation_metadata: Callable[[], Mapping[str, object]] = (
         _default_generation_metadata
     )
@@ -136,7 +156,6 @@ def load_default_dependencies() -> ExperimentDependencies:
 
     return ExperimentDependencies(
         run_PCoT=main_module.run_PCoT,
-        run_PCoT_Re=main_module.run_PCoT_Re,
         get_article=actor_module.get_article,
         get_available_indices=actor_module.get_available_indices,
         extract_prediction=evaluator_module.extract_prediction,
@@ -144,6 +163,7 @@ def load_default_dependencies() -> ExperimentDependencies:
         EM_score=evaluator_module.EM_score,
         make_reflection_PCoT=reflection_module.make_reflection_PCoT,
         generation_metadata=llm_module.generation_metadata,
+        run_PCoT_GT_EPM_Re=main_module.run_PCoT_GT_EPM_Re,
     )
 
 
@@ -246,13 +266,17 @@ def build_result_config(
         "pipeline_key": spec.key,
         "pipeline": spec.label,
         "use_reflection": spec.use_reflection,
+        "use_gt": spec.use_gt,
+        "use_epm": spec.use_epm,
         "num_samples": len(selected_indices),
         "max_trials": max_trials,
         "max_reflections": MAX_REFLECTIONS,
+        "max_trajectories": MAX_TRAJECTORIES,
         "indices": selected_indices,
         "dataset": DATASET_ID,
         "article_field": ARTICLE_TEXT_FIELD,
         "prompt_version": PROMPT_VERSION,
+        "epm_memory_version": EPM_MEMORY_VERSION,
         "final_mode": mode,
         "generation_metadata": generation_values,
     }
@@ -262,7 +286,10 @@ def _runner_for(
     spec: PipelineSpec,
     dependencies: ExperimentDependencies,
 ) -> Callable[..., Mapping[str, object]]:
-    return getattr(dependencies, spec.runner_name)
+    runner = getattr(dependencies, spec.runner_name, None)
+    if runner is not None:
+        return runner
+    raise ValueError(f"no runner is configured for {spec.runner_name}")
 
 
 def _supports_final_mode(runner: Callable[..., object]) -> bool:
@@ -282,11 +309,15 @@ def _run_trajectory(
     runner: Callable[..., Mapping[str, object]],
     *,
     index: Any,
+    trajectories: list[str],
     reflections: list[str],
+    use_epm: bool,
     use_reflection: bool,
     final_mode: str,
 ) -> Mapping[str, object]:
     arguments: list[object] = [index]
+    if use_epm:
+        arguments.append(trajectories)
     if use_reflection:
         arguments.append(reflections)
     if _supports_final_mode(runner):
@@ -363,9 +394,13 @@ def _build_pipeline_result(
         "config": dict(config),
         "pipeline_key": spec.key,
         "pipeline": spec.label,
+        "use_gt": spec.use_gt,
+        "use_epm": spec.use_epm,
+        "use_reflection": spec.use_reflection,
         "num_samples": total_samples,
         "max_trials": max_trials,
         "max_reflections": MAX_REFLECTIONS,
+        "max_trajectories": MAX_TRAJECTORIES,
         "prompt_version": config["prompt_version"],
         "final_mode": config["final_mode"],
         "generation_metadata": dict(config["generation_metadata"]),
@@ -443,6 +478,7 @@ def evaluate_pipeline(
 
         gold_label = _normalise_label(dependencies.get_gold_label(index))
         attempts: list[dict[str, Any]] = []
+        trajectories: list[str] = []
         reflections: list[str] = []
         success_trial: int | None = None
         oom_stage: str | None = None
@@ -450,12 +486,15 @@ def evaluate_pipeline(
         oom_error: str | None = None
 
         for trial in range(1, max_trials + 1):
+            trajectory_used = list(trajectories) if spec.use_epm else []
             reflection_used = list(reflections) if spec.use_reflection else []
             try:
                 raw_trajectory = _run_trajectory(
                     runner,
                     index=index,
+                    trajectories=trajectory_used,
                     reflections=reflection_used,
+                    use_epm=spec.use_epm,
                     use_reflection=spec.use_reflection,
                     final_mode=mode,
                 )
@@ -486,27 +525,41 @@ def evaluate_pipeline(
                 prediction = ""
 
             correct = bool(dependencies.EM_score(final_response, index))
+            trajectory_generated: str | None = None
             reflection_generated: str | None = None
             if correct:
                 success_trial = trial
-            elif spec.use_reflection and trial < max_trials:
-                try:
-                    generated = dependencies.make_reflection_PCoT(
-                        dependencies.get_article(index),
+            elif trial < max_trials:
+                # EPM and Reflexion are separate memories. Preserve Stage 1,
+                # but remove the model's Stage-2 prediction before either
+                # memory-generation path. Only the latest EPM is retained.
+                if spec.use_epm:
+                    trajectory_generated = format_pcot_trajectory(
                         persuasion,
                         final_response,
                     )
-                except Exception as error:
-                    if not is_oom_error(error):
-                        raise
-                    oom_stage = "reflection"
-                    oom_trial = trial
-                    oom_error = _summarise_oom_error(error)
-                else:
-                    sanitised = (
-                        generated.strip() if isinstance(generated, str) else ""
-                    )
-                    if sanitised:
+                    trajectories[:] = [trajectory_generated]
+                if spec.use_reflection:
+                    stage_one_reasoning = extract_epm_reasoning(persuasion)
+                    stage_two_reasoning = extract_epm_reasoning(final_response)
+                    try:
+                        generated = dependencies.make_reflection_PCoT(
+                            dependencies.get_article(index),
+                            stage_one_reasoning,
+                            stage_two_reasoning,
+                        )
+                    except Exception as error:
+                        if not is_oom_error(error):
+                            raise
+                        oom_stage = "reflection"
+                        oom_trial = trial
+                        oom_error = _summarise_oom_error(error)
+                    else:
+                        sanitised = sanitize_reflection(generated)
+                        if not sanitised:
+                            raise ValueError(
+                                "reflection model returned no label-blind content"
+                            )
                         reflection_generated = sanitised
                         reflections.append(sanitised)
                         if len(reflections) > MAX_REFLECTIONS:
@@ -524,6 +577,8 @@ def evaluate_pipeline(
                     "gold_label": gold_label,
                     "correct": correct,
                     "outcome": "correct" if correct else "incorrect",
+                    "trajectory_used": trajectory_used,
+                    "trajectory_generated": trajectory_generated,
                     "reflection": reflection_generated,
                     "reflection_used": reflection_used,
                     "reflection_generated": reflection_generated,
@@ -600,6 +655,8 @@ _ATTEMPT_KEYS = {
     "gold_label",
     "correct",
     "outcome",
+    "trajectory_used",
+    "trajectory_generated",
     "reflection",
     "reflection_used",
     "reflection_generated",
@@ -619,6 +676,8 @@ def _validate_completed_samples(
     indices = list(expected_config.get("indices", []))
     num_samples = expected_config.get("num_samples")
     max_trials = expected_config.get("max_trials")
+    use_gt = expected_config.get("use_gt")
+    use_epm = expected_config.get("use_epm")
     use_reflection = expected_config.get("use_reflection")
     if not isinstance(num_samples, int) or num_samples <= 0:
         return False, "invalid expected sample count"
@@ -626,8 +685,18 @@ def _validate_completed_samples(
         return False, "invalid expected index list"
     if not isinstance(max_trials, int) or max_trials <= 0:
         return False, "invalid expected trial count"
-    if not isinstance(use_reflection, bool):
-        return False, "invalid reflection switch"
+    for switch_name, switch_value in (
+        ("GT", use_gt),
+        ("EPM", use_epm),
+        ("reflection", use_reflection),
+    ):
+        if not isinstance(switch_value, bool):
+            return False, f"invalid {switch_name} switch"
+    if (use_gt, use_epm, use_reflection) not in {
+        (False, False, False),
+        (True, True, True),
+    }:
+        return False, "unsupported intermediate pipeline combination"
     if len(results) > num_samples:
         return False, "too many sample results"
     if require_complete and len(results) != num_samples:
@@ -693,6 +762,7 @@ def _validate_completed_samples(
         if sample.get("attempt_count") != len(attempts):
             return False, "attempt count mismatch"
 
+        expected_trajectories: list[str] = []
         expected_reflections: list[str] = []
         correct_trials: list[int] = []
         for trial, record in enumerate(attempts, start=1):
@@ -738,6 +808,28 @@ def _validate_completed_samples(
             if record.get("outcome") != expected_outcome:
                 return False, "attempt outcome mismatch"
 
+            trajectory_used = record.get("trajectory_used")
+            expected_trajectory_used = (
+                expected_trajectories if use_epm else []
+            )
+            if trajectory_used != expected_trajectory_used:
+                return False, "attempt EPM history does not match"
+            trajectory_generated = record.get("trajectory_generated")
+            should_generate_trajectory = (
+                use_epm and not correct and trial < max_trials
+            )
+            if should_generate_trajectory:
+                if not isinstance(trajectory_generated, str):
+                    return False, "failed retry did not generate an EPM trajectory"
+                if trajectory_generated != format_pcot_trajectory(
+                    persuasion,
+                    final_response,
+                ):
+                    return False, "generated EPM does not match the current trajectory"
+                expected_trajectories = [trajectory_generated]
+            elif trajectory_generated is not None:
+                return False, "unexpected EPM trajectory was generated"
+
             used = record.get("reflection_used")
             expected_used = expected_reflections if use_reflection else []
             if used != expected_used:
@@ -751,12 +843,27 @@ def _validate_completed_samples(
                 not generated.strip() or generated != generated.strip()
             ):
                 return False, "generated reflection was not sanitised"
+            if isinstance(generated, str) and sanitize_reflection(generated) != generated:
+                return False, "generated reflection contains classification feedback"
             if not use_reflection and generated is not None:
                 return False, "plain PCoT generated a reflection"
             if correct and generated is not None:
                 return False, "successful attempt generated a reflection"
             if trial == max_trials and generated is not None:
                 return False, "reflection was generated after the final attempt"
+            reflection_oom_attempt = bool(
+                oom_skipped
+                and oom_stage == "reflection"
+                and oom_trial == trial
+            )
+            should_generate_reflection = bool(
+                use_reflection
+                and not correct
+                and trial < max_trials
+                and not reflection_oom_attempt
+            )
+            if should_generate_reflection and not isinstance(generated, str):
+                return False, "failed retry did not generate a reflection"
             if isinstance(generated, str):
                 expected_reflections = (expected_reflections + [generated])[
                     -MAX_REFLECTIONS:
@@ -855,9 +962,13 @@ def validate_pipeline_result(
     for field in (
         "pipeline_key",
         "pipeline",
+        "use_gt",
+        "use_epm",
+        "use_reflection",
         "num_samples",
         "max_trials",
         "max_reflections",
+        "max_trajectories",
         "prompt_version",
         "final_mode",
         "generation_metadata",
@@ -884,6 +995,8 @@ def validate_pipeline_result(
         label=str(expected["pipeline"]),
         runner_name="",
         use_reflection=bool(expected["use_reflection"]),
+        use_gt=bool(expected["use_gt"]),
+        use_epm=bool(expected["use_epm"]),
     )
     recomputed = _build_pipeline_result(spec, expected, results)
     for field in (
@@ -1025,6 +1138,9 @@ def build_aggregate_metrics(
             {
                 "pipeline_key": spec.key,
                 "pipeline": spec.label,
+                "use_gt": spec.use_gt,
+                "use_epm": spec.use_epm,
+                "use_reflection": spec.use_reflection,
                 "cumulative_success": rates,
                 "solved_at_trial": list(result["solved_at_trial"]),
                 "final_solved": result["trial_summary"][-1]["total_solved"],
@@ -1040,6 +1156,7 @@ def build_aggregate_metrics(
         "num_samples": len(indices),
         "max_trials": max_trials,
         "max_reflections": MAX_REFLECTIONS,
+        "max_trajectories": MAX_TRAJECTORIES,
         "indices": list(indices),
         "prompt_version": PROMPT_VERSION,
         "final_mode": normalise_final_mode(final_mode),
@@ -1257,6 +1374,7 @@ __all__ = [
     "EVALUATION_MODE",
     "ExperimentDependencies",
     "MAX_REFLECTIONS",
+    "MAX_TRAJECTORIES",
     "MAX_TRIALS",
     "NUM",
     "OUTPUT_DIR",
